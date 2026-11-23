@@ -10,6 +10,10 @@
 
 #include "scalar.hpp"
 
+#if defined(DEEN_X86)
+#include <emmintrin.h>
+#endif
+
 namespace deen {
 
 std::vector<uint16_t> adaptiveThresholds(int rad, int thr, float min) {
@@ -72,35 +76,43 @@ void checkRange(const char* name, int v, int lo, int hi) {
                              std::to_string(hi));
 }
 
-// Edge-replicated copy of a plane with `pad` samples on every side.
-struct Padded {
-  std::vector<uint8_t> buf;
-  ptrdiff_t stride = 0;
-  const uint8_t* origin = nullptr;
-};
+// Sum of |a - b| over one row (Deen's scene metric), integer and therefore exact in any order.
+uint64_t rowSad8(const uint8_t* a, const uint8_t* b, int w) {
+  uint64_t sum = 0;
+  int x = 0;
+#if defined(DEEN_X86)
+  __m128i acc = _mm_setzero_si128();
+  for (; x + 16 <= w; x += 16)
+    acc = _mm_add_epi64(acc, _mm_sad_epu8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(a + x)),
+                                          _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + x))));
+  sum = uint64_t(_mm_cvtsi128_si64(acc)) + uint64_t(_mm_cvtsi128_si64(_mm_unpackhi_epi64(acc, acc)));
+#endif
+  for (; x < w; x++) sum += uint32_t(std::abs(int(a[x]) - int(b[x])));
+  return sum;
+}
 
-void padPlane(const uint8_t* src, ptrdiff_t sstride, int w, int h, int pad, int bps, Padded* out) {
-  const ptrdiff_t row_bytes = ptrdiff_t(w + 2 * pad) * bps;
-  out->stride = (row_bytes + 63) & ~ptrdiff_t(63);
-  out->buf.resize(size_t(out->stride) * size_t(h + 2 * pad) + 64);
-  uint8_t* base = out->buf.data();
-  for (int y = -pad; y < h + pad; y++) {
-    const uint8_t* s = src + ptrdiff_t(std::min(std::max(y, 0), h - 1)) * sstride;
-    uint8_t* d = base + ptrdiff_t(y + pad) * out->stride;
-    std::memcpy(d + pad * bps, s, size_t(w) * bps);
-    if (bps == 1) {
-      std::memset(d, s[0], size_t(pad));
-      std::memset(d + pad + w, s[w - 1], size_t(pad));
-    } else {
-      const uint16_t* s16 = reinterpret_cast<const uint16_t*>(s);
-      uint16_t* d16 = reinterpret_cast<uint16_t*>(d);
-      for (int x = 0; x < pad; x++) {
-        d16[x] = s16[0];
-        d16[pad + w + x] = s16[w - 1];
-      }
+uint64_t rowSad16(const uint16_t* a, const uint16_t* b, int w) {
+  uint64_t sum = 0;
+  int x = 0;
+#if defined(DEEN_X86)
+  // |a - b| summed in 32-bit lanes, flushed every 2^14 vectors (each lane adds at most 2 * 65535 per vector).
+  const __m128i flip = _mm_set1_epi16(short(0x8000)), ones = _mm_set1_epi16(1), zero = _mm_setzero_si128();
+  while (x + 8 <= w) {
+    __m128i acc = zero;
+    for (int i = 0; i < 16384 && x + 8 <= w; i++, x += 8) {
+      const __m128i va = _mm_loadu_si128(reinterpret_cast<const __m128i*>(a + x));
+      const __m128i vb = _mm_loadu_si128(reinterpret_cast<const __m128i*>(b + x));
+      const __m128i d = _mm_or_si128(_mm_subs_epu16(va, vb), _mm_subs_epu16(vb, va));
+      // d - 0x8000 is a signed 16-bit value; pmaddwd adds lane pairs, then add back 2 * 0x8000 per pair.
+      acc = _mm_add_epi32(acc, _mm_add_epi32(_mm_madd_epi16(_mm_xor_si128(d, flip), ones), _mm_set1_epi32(0x10000)));
     }
+    alignas(16) uint32_t t[4];
+    _mm_store_si128(reinterpret_cast<__m128i*>(t), acc);
+    sum += uint64_t(t[0]) + t[1] + t[2] + t[3];
   }
-  out->origin = base + ptrdiff_t(pad) * out->stride + ptrdiff_t(pad) * bps;
+#endif
+  for (; x < w; x++) sum += uint32_t(std::abs(int(a[x]) - int(b[x])));
+  return sum;
 }
 
 }  // namespace
@@ -166,17 +178,10 @@ double Engine::sceneDiff(const FrameView& a, const FrameView& b) const {
     for (int y = 0; y < h; y++) {
       const uint8_t* ra = a.data[pl] + y * a.stride[pl];
       const uint8_t* rb = b.data[pl] + y * b.stride[pl];
-      uint32_t rs = 0;
-      if (fmt_.bits == 8) {
-        for (int x = 0; x < w; x++) rs += uint32_t(std::abs(int(ra[x]) - int(rb[x])));
-        sum += rs;
-      } else {
-        const uint16_t* pa = reinterpret_cast<const uint16_t*>(ra);
-        const uint16_t* pb = reinterpret_cast<const uint16_t*>(rb);
-        uint64_t s64 = 0;
-        for (int x = 0; x < w; x++) s64 += uint32_t(std::abs(int(pa[x]) - int(pb[x])));
-        sum += s64;
-      }
+      if (fmt_.bits == 8)
+        sum += rowSad8(ra, rb, w);
+      else
+        sum += rowSad16(reinterpret_cast<const uint16_t*>(ra), reinterpret_cast<const uint16_t*>(rb), w);
     }
     total = total + double(sum) / double(int64_t(w) * h) * scale;
   }
@@ -207,12 +212,10 @@ void Engine::filterPlane(int pl, bool use3d, const FrameView* src[3], const Fram
 
   const Tables& t = tables_[use3d ? 1 : 0][pl];
   const int nsrc = use3d ? 3 : 1;
-  Padded pad[3];
   PlaneArgs a;
   for (int s = 0; s < nsrc; s++) {
-    padPlane(src[s]->data[pl], src[s]->stride[pl], w, h, r, bps, &pad[s]);
-    a.src[s] = pad[s].origin;
-    a.stride[s] = pad[s].stride;
+    a.src[s] = src[s]->data[pl];
+    a.stride[s] = src[s]->stride[pl];
     a.thr[s] = t.thr[s].data();
     a.weight[s] = family_ == kWMode ? t.weight[s].data() : nullptr;
   }
@@ -220,6 +223,7 @@ void Engine::filterPlane(int pl, bool use3d, const FrameView* src[3], const Fram
   a.dst = out.data[pl];
   a.dst_stride = out.stride[pl];
   a.width = w;
+  a.height = h;
   a.y0 = y0;
   a.y1 = y1;
   a.rad = r;

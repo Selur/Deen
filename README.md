@@ -121,23 +121,30 @@ see ALGORITHM.md).
 
 ## Performance
 
-640x352 4:2:0 8 bit, one thread, frames per second (VapourSynth R82, synthetic noise, AMD Ryzen 9 7950X), and the
-`a` modes against an Expr implementation of the same formulas (akarin.Expr):
+1920x1080 4:2:0, frames per second, AVX2 (VapourSynth R82, AMD Ryzen 9 7950X, 32 threads), Deen 1.0.0 against 1.0.1
+and neo_smo.Deen (a different algorithm, for comparison only; thresholds 7/9, 4/6, min 0.5):
 
-| Call | C | SSE4.1 | AVX2 | Expr (akarin) |
-|---|---:|---:|---:|---:|
-| `c2d`, rad 1 | 293 | 3019 | 4518 | |
-| `c3d`, rad 1 | 113 | 1486 | 2705 | |
-| `a2d`, rad 1 | 240 | 1973 | 2390 | 1194 |
-| `a2d`, rad 2 | 113 | 1296 | 1877 | 669 |
-| `a2d`, rad 7 | 16 | 262 | 560 | 48 |
-| `a3d`, rad 1 | 94 | 1145 | 1728 | 609 |
-| `a3d`, rad 2 | 37 | 601 | 1091 | 169 |
-| `a3d`, rad 4 | 14 | 236 | 507 | 43 |
-| `w2d`, rad 2 | 100 | 1368 | 2213 | |
-| `w3d`, rad 2 | 32 | 535 | 989 | |
+| HD, rad 1 | 1 thread: 1.0.0 | 1.0.1 | neo_smo | all threads: 1.0.0 | 1.0.1 | neo_smo |
+|---|---:|---:|---:|---:|---:|---:|
+| `c2d` 8 bit | 835 | **1517** | 1267 | 3969 | **9872** | 9428 |
+| `c3d` 8 bit | 317 | **563** | 189 | 1512 | **7344** | 2867 |
+| `a2d` 8 bit | 334 | **863** | 568 | 3633 | **9087** | 8701 |
+| `a3d` 8 bit | 196 | **369** | 155 | 1529 | **4670** | 2443 |
+| `w2d` 8 bit | 716 | **1238** | 1122 | 3715 | **9217** | 9323 |
+| `w3d` 8 bit | 258 | **420** | 176 | 1522 | **5607** | 2672 |
+| `c2d` 16 bit | 176 | **692** | 546 | 1350 | **4212** | 4411 |
+| `c3d` 16 bit | 86 | **240** | 135 | 534 | **3682** | 2113 |
+| `a2d` 16 bit | 89 | **517** | 436 | 1384 | **4765** | 4614 |
+| `a3d` 16 bit | 71 | **205** | 125 | 556 | **2893** | 1938 |
+| `w2d` 16 bit | 337 | **679** | 561 | 1377 | **4802** | 4717 |
+| `w3d` 16 bit | 105 | **212** | 121 | 542 | **2967** | 1796 |
 
-Measure with `test/bench.py`.
+At every size (720x576, 1920x1080, 3840x2160), mode, radius (1, 2, 4), bit depth and thread count measured,
+1.0.1 is 1.04x to 6.9x as fast as 1.0.0, and faster than neo_smo or within a few percent of it where both
+run at the memory limit (for example 16-bit `c2d` rad 1 with all threads above, 0.95x to 0.99x over several runs).
+NEON (Apple M4 Pro, 1920x1080): as fast as 1.0.0 or faster, 1.2x to 2.7x as fast as neo_smo.
+
+Measure with `test/bench.py` (`--neo` adds neo_smo, `--opt` picks the instruction set).
 
 ## Build from source
 
@@ -158,7 +165,7 @@ Tests in `test/` (Python with numpy):
 | `test_deen.py [plugin]` | VapourSynth: bit for bit against the numpy model `model.py` (written from ALGORITHM.md), every mode, radius and borderfix for every instruction set, 8/10/16 bit, errors |
 | `test_avs.py` | AviSynth+ (Windows, `avs2yuv64`, BestSource): the same model, Deen 1.0 beta 1 argument order, errors |
 | `kernel_test.cpp` | `meson test`: every SIMD tier against C on random data |
-| `bench.py` | speed per mode and instruction set |
+| `bench.py` | speed per mode, radius, bit depth, frame size and thread count, optionally against neo_smo |
 
 ## Credits and license
 

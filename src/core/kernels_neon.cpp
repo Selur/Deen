@@ -3,6 +3,7 @@
 #include <arm_neon.h>
 
 #include "kernels.hpp"
+#include "rows.hpp"
 #include "scalar.hpp"
 
 namespace deen {
@@ -12,6 +13,11 @@ struct S {
   using V8 = uint8x16_t;
   using V16 = uint16x8_t;
   using V32 = uint32x4_t;
+  using VF = float32x4_t;
+  // |c - n| <= t is two instructions (vabd, vcle), fewer than the range compare.
+  static constexpr bool kRange = false;
+  static constexpr bool kSplit16 = false;
+  static constexpr bool kMadd = false;
   static constexpr int N8 = 16, N16 = 8;
 
   static V8 load8(const uint8_t* p) { return vld1q_u8(p); }
@@ -63,6 +69,19 @@ struct S {
   static V32 shr32(V32 v) { return vshrq_n_u32(v, K); }
   static V32 mullo32lo(V16 a, V16 b) { return vmull_u16(vget_low_u16(a), vget_low_u16(b)); }
   static V32 mullo32hi(V16 a, V16 b) { return vmull_high_u16(a, b); }
+
+  static V16 lo8x256(V8 v) { return vshll_n_u8(vget_low_u8(v), 8); }
+  static V16 hi8x256(V8 v) { return vshll_high_n_u8(v, 8); }
+  static void addpair8(V16& sl, V16& sh, V8 a, V8 b) {
+    sl = vaddq_u16(sl, vaddl_u8(vget_low_u8(a), vget_low_u8(b)));
+    sh = vaddq_u16(sh, vaddl_high_u8(a, b));
+  }
+  static VF setf(float v) { return vdupq_n_f32(v); }
+  template <int K>
+  static V32 shl32(V32 v) { return vshlq_n_u32(v, K); }
+  static VF cvtf(V32 v) { return vcvtq_f32_u32(v); }
+  static VF divf(VF a, VF b) { return vdivq_f32(a, b); }
+  static V32 cvti(VF v) { return vcvtq_u32_f32(v); }
 };
 
 #include "kernels_simd.hpp"

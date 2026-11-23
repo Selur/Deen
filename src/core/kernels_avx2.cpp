@@ -4,6 +4,7 @@
 #include <immintrin.h>
 
 #include "kernels.hpp"
+#include "rows.hpp"
 #include "scalar.hpp"
 
 namespace deen {
@@ -13,6 +14,10 @@ struct S {
   using V8 = __m256i;
   using V16 = __m256i;
   using V32 = __m256i;
+  using VF = __m256;
+  static constexpr bool kRange = true;
+  static constexpr bool kSplit16 = true;
+  static constexpr bool kMadd = true;
   static constexpr int N8 = 32, N16 = 16;
 
   static V8 load8(const uint8_t* p) { return _mm256_loadu_si256(reinterpret_cast<const __m256i*>(p)); }
@@ -62,6 +67,32 @@ struct S {
   static V32 mullo32hi(V16 a, V16 b) {
     return _mm256_unpackhi_epi16(_mm256_mullo_epi16(a, b), _mm256_mulhi_epu16(a, b));
   }
+
+  static V16 lo8x256(V8 v) { return _mm256_unpacklo_epi8(_mm256_setzero_si256(), v); }
+  static V16 hi8x256(V8 v) { return _mm256_unpackhi_epi8(_mm256_setzero_si256(), v); }
+  // pmaddubsw of the interleaved bytes with 1: a + b per 16-bit lane, at most 510.
+  static void addpair8(V16& sl, V16& sh, V8 a, V8 b) {
+    sl = _mm256_add_epi16(sl, _mm256_maddubs_epi16(_mm256_unpacklo_epi8(a, b), _mm256_set1_epi8(1)));
+    sh = _mm256_add_epi16(sh, _mm256_maddubs_epi16(_mm256_unpackhi_epi8(a, b), _mm256_set1_epi8(1)));
+  }
+  static void maddpair16(V32& wl, V32& wh, V16 v1, V16 v2, V32 w) {
+    const V16 flip = _mm256_set1_epi16(short(0x8000));
+    const V16 a = _mm256_xor_si256(v1, flip), b = _mm256_xor_si256(v2, flip);
+    wl = _mm256_add_epi32(wl, _mm256_madd_epi16(_mm256_unpacklo_epi16(a, b), w));
+    wh = _mm256_add_epi32(wh, _mm256_madd_epi16(_mm256_unpackhi_epi16(a, b), w));
+  }
+  static VF setf(float v) { return _mm256_set1_ps(v); }
+  static V8 subs8(V8 a, V8 b) { return _mm256_subs_epu8(a, b); }
+  static V8 inrange8(V8 n, V8 lo, V8 hi) { return _mm256_cmpeq_epi8(_mm256_max_epu8(_mm256_min_epu8(n, hi), lo), n); }
+  static V16 subs16(V16 a, V16 b) { return _mm256_subs_epu16(a, b); }
+  static V16 inrange16(V16 n, V16 lo, V16 hi) {
+    return _mm256_cmpeq_epi16(_mm256_max_epu16(_mm256_min_epu16(n, hi), lo), n);
+  }
+  template <int K>
+  static V32 shl32(V32 v) { return _mm256_slli_epi32(v, K); }
+  static VF cvtf(V32 v) { return _mm256_cvtepi32_ps(v); }
+  static VF divf(VF a, VF b) { return _mm256_div_ps(a, b); }
+  static V32 cvti(VF v) { return _mm256_cvttps_epi32(v); }
 };
 
 #include "kernels_simd.hpp"

@@ -9,15 +9,15 @@ namespace deen {
 
 enum Family { kCMode = 0, kAMode = 1, kWMode = 2 };
 
-// One plane. Sources are edge-replicated copies with at least `rad` samples of padding on every side; src[i] points
-// at image sample (0, 0), so src[i] + y * stride[i] + x * bytes_per_sample is valid for x, y in [-rad, size + rad).
+// One plane. Sources are the planes as they are (no padding); the kernels read them through a window of padded row
+// copies (rows.hpp), which gives the edge replication. src[i] points at sample (0, 0).
 struct PlaneArgs {
   const uint8_t* src[3] = {nullptr, nullptr, nullptr};  // current, previous, next frame
   ptrdiff_t stride[3] = {0, 0, 0};                      // bytes
   int nsrc = 1;                                         // 1 (2d) or 3 (3d)
   uint8_t* dst = nullptr;                               // row 0 of the output plane
   ptrdiff_t dst_stride = 0;
-  int width = 0;
+  int width = 0, height = 0;
   int y0 = 0, y1 = 0;                                   // rows [y0, y1) are filtered
   int rad = 1;
   int bits = 8;                                         // 8..16

@@ -3,6 +3,7 @@
 #include <smmintrin.h>
 
 #include "kernels.hpp"
+#include "rows.hpp"
 #include "scalar.hpp"
 
 namespace deen {
@@ -12,6 +13,10 @@ struct S {
   using V8 = __m128i;
   using V16 = __m128i;
   using V32 = __m128i;
+  using VF = __m128;
+  static constexpr bool kRange = true;
+  static constexpr bool kSplit16 = true;
+  static constexpr bool kMadd = true;
   static constexpr int N8 = 16, N16 = 8;
 
   static V8 load8(const uint8_t* p) { return _mm_loadu_si128(reinterpret_cast<const __m128i*>(p)); }
@@ -57,6 +62,30 @@ struct S {
   static V32 shr32(V32 v) { return _mm_srli_epi32(v, K); }
   static V32 mullo32lo(V16 a, V16 b) { return _mm_unpacklo_epi16(_mm_mullo_epi16(a, b), _mm_mulhi_epu16(a, b)); }
   static V32 mullo32hi(V16 a, V16 b) { return _mm_unpackhi_epi16(_mm_mullo_epi16(a, b), _mm_mulhi_epu16(a, b)); }
+
+  static V16 lo8x256(V8 v) { return _mm_unpacklo_epi8(_mm_setzero_si128(), v); }
+  static V16 hi8x256(V8 v) { return _mm_unpackhi_epi8(_mm_setzero_si128(), v); }
+  // pmaddubsw of the interleaved bytes with 1: a + b per 16-bit lane, at most 510.
+  static void addpair8(V16& sl, V16& sh, V8 a, V8 b) {
+    sl = _mm_add_epi16(sl, _mm_maddubs_epi16(_mm_unpacklo_epi8(a, b), _mm_set1_epi8(1)));
+    sh = _mm_add_epi16(sh, _mm_maddubs_epi16(_mm_unpackhi_epi8(a, b), _mm_set1_epi8(1)));
+  }
+  static void maddpair16(V32& wl, V32& wh, V16 v1, V16 v2, V32 w) {
+    const V16 flip = _mm_set1_epi16(short(0x8000));
+    const V16 a = _mm_xor_si128(v1, flip), b = _mm_xor_si128(v2, flip);
+    wl = _mm_add_epi32(wl, _mm_madd_epi16(_mm_unpacklo_epi16(a, b), w));
+    wh = _mm_add_epi32(wh, _mm_madd_epi16(_mm_unpackhi_epi16(a, b), w));
+  }
+  static VF setf(float v) { return _mm_set1_ps(v); }
+  static V8 subs8(V8 a, V8 b) { return _mm_subs_epu8(a, b); }
+  static V8 inrange8(V8 n, V8 lo, V8 hi) { return _mm_cmpeq_epi8(_mm_max_epu8(_mm_min_epu8(n, hi), lo), n); }
+  static V16 subs16(V16 a, V16 b) { return _mm_subs_epu16(a, b); }
+  static V16 inrange16(V16 n, V16 lo, V16 hi) { return _mm_cmpeq_epi16(_mm_max_epu16(_mm_min_epu16(n, hi), lo), n); }
+  template <int K>
+  static V32 shl32(V32 v) { return _mm_slli_epi32(v, K); }
+  static VF cvtf(V32 v) { return _mm_cvtepi32_ps(v); }
+  static VF divf(VF a, VF b) { return _mm_div_ps(a, b); }
+  static V32 cvti(VF v) { return _mm_cvttps_epi32(v); }
 };
 
 #include "kernels_simd.hpp"

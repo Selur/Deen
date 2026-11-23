@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: MIT
-// Compares every available SIMD tier with the C reference kernels on random data: widths 1..80, every mode family,
-// 2d and 3d, every radius, 8/10/12/16 bit, random thresholds, real and random weights, random, extreme and flat content.
+// Compares every available SIMD tier with the C reference kernels on random data: widths 1..300, every mode family,
+// 2d and 3d, every radius, 8/10/12/16 bit, random thresholds, real and random weights, random, extreme and flat
+// content; and the scene metric against the plain formula.
 // Run: meson test -C build (or build/kernel_test). Exit code 0 = all tiers identical to C.
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <vector>
@@ -20,21 +22,21 @@ std::mt19937 rng(20031);
 
 int rnd(int lo, int hi) { return std::uniform_int_distribution<int>(lo, hi)(rng); }
 
-// A padded plane: pad samples on every side, padding filled like the image (the kernels never see unpadded memory).
+// A plane with a random stride; the samples past the width are filled too (the kernels must not read them).
 struct Plane {
   std::vector<uint8_t> buf;
   ptrdiff_t stride = 0;
   const uint8_t* origin = nullptr;
 };
 
-Plane makePlane(int w, int h, int pad, int bits, int kind) {
+Plane makePlane(int w, int h, int bits, int kind) {
   Plane p;
   const int bps = bits == 8 ? 1 : 2;
-  p.stride = ptrdiff_t(w + 2 * pad + rnd(0, 20)) * bps;
-  p.buf.assign(size_t(p.stride) * (h + 2 * pad) + 64, 0);
+  p.stride = ptrdiff_t(w + rnd(0, 20)) * bps;
+  p.buf.assign(size_t(p.stride) * h, 0);
   const int maxv = (1 << bits) - 1;
   const int base = rnd(0, maxv);
-  for (int y = 0; y < h + 2 * pad; y++)
+  for (int y = 0; y < h; y++)
     for (int x = 0; x < p.stride / bps; x++) {
       int v;
       switch (kind) {
@@ -49,7 +51,7 @@ Plane makePlane(int w, int h, int pad, int bits, int kind) {
       else
         reinterpret_cast<uint16_t*>(row)[x] = uint16_t(v);
     }
-  p.origin = p.buf.data() + pad * p.stride + pad * bps;
+  p.origin = p.buf.data();
   return p;
 }
 
@@ -73,7 +75,7 @@ int main() {
     const bool d3 = (iter / 3) % 2 == 1;
     const int rad = rnd(1, d3 ? 4 : 7);
     const int bits = bitsList[rnd(0, 3)];
-    const int w = rnd(1, 80), h = rnd(1, 6);
+    const int w = rnd(0, 3) ? rnd(1, 80) : rnd(81, 300), h = rnd(1, 20);
     const int kind = rnd(0, 3);
     const int nsrc = d3 ? 3 : 1;
     const int taps = (2 * rad + 1) * (2 * rad + 1);
@@ -81,7 +83,7 @@ int main() {
     Plane src[3];
     std::vector<uint16_t> thr[3], wt[3];
     for (int s = 0; s < nsrc; s++) {
-      src[s] = makePlane(w, h, rad, bits, kind);
+      src[s] = makePlane(w, h, bits, kind);
       if (family == kAMode) {
         thr[s] = adaptiveThresholds(rad, rnd(0, 255), float(rnd(0, 100)) / 100.0f);
       } else {
@@ -111,6 +113,7 @@ int main() {
     a.nsrc = nsrc;
     a.dst_stride = dstride;
     a.width = w;
+    a.height = h;
     a.y0 = rnd(0, 1) ? 0 : std::min(h, rad);
     a.y1 = std::max(a.y0, rnd(0, 1) ? h : h - rad);
     a.rad = rad;
@@ -129,6 +132,56 @@ int main() {
                       bits, w, h, kind);
         failures++;
       }
+    }
+  }
+  // Scene metric (Engine::sceneDiff, SIMD sums of |a - b|) against the plain formula: random, extreme and maximal
+  // differences.
+  for (int iter = 0; iter < 300; iter++) {
+    Format f;
+    f.bits = bitsList[rnd(0, 3)];
+    f.width = rnd(0, 3) ? rnd(2, 80) : rnd(81, 600);
+    f.height = rnd(2, 8);
+    f.planes = rnd(0, 1) ? 3 : 1;
+    f.ssw = rnd(0, 1);
+    f.ssh = rnd(0, 1);
+    Params p;
+    p.opt = 0;
+    const Engine e(p, f, 3);
+    const int bps = f.bits == 8 ? 1 : 2, maxv = (1 << f.bits) - 1, kind = rnd(0, 2);
+    std::vector<uint8_t> buf[2][3];
+    FrameView v[2];
+    double want = 0.0;
+    for (int pl = 0; pl < f.planes; pl++) {
+      const int w = pl ? f.width >> f.ssw : f.width, h = pl ? f.height >> f.ssh : f.height;
+      const ptrdiff_t stride = ptrdiff_t(w + rnd(0, 9)) * bps;
+      for (int i = 0; i < 2; i++) {
+        buf[i][pl].assign(size_t(stride) * h, 0);
+        v[i].data[pl] = buf[i][pl].data();
+        v[i].stride[pl] = stride;
+      }
+      uint64_t sum = 0;
+      for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+          int s[2];
+          for (int i = 0; i < 2; i++) {
+            s[i] = kind == 0 ? rnd(0, maxv) : kind == 1 ? (rnd(0, 1) ? maxv : 0) : (i ? maxv : 0);
+            uint8_t* row = buf[i][pl].data() + y * stride;
+            if (bps == 1)
+              row[x] = uint8_t(s[i]);
+            else
+              reinterpret_cast<uint16_t*>(row)[x] = uint16_t(s[i]);
+          }
+          sum += uint64_t(std::abs(s[0] - s[1]));
+        }
+      const double scale = f.bits == 8 ? 1.0 : 255.0 / double(maxv);
+      want = want + double(sum) / double(int64_t(w) * h) * scale;
+    }
+    want = f.planes == 3 ? want * 0.3333333333333333 : want / double(f.planes);
+    checks++;
+    if (e.sceneDiff(v[0], v[1]) != want) {
+      if (failures < 30)
+        std::printf("FAIL sceneDiff bits=%d w=%d h=%d planes=%d\n", f.bits, f.width, f.height, f.planes);
+      failures++;
     }
   }
   std::printf("%d checks, %d failures\n", checks, failures);

@@ -62,22 +62,18 @@ inline uint32_t finishDiv16(uint32_t sum, uint32_t n) { return divSmall(sum + (n
 inline uint32_t finishA16(uint32_t sum, uint32_t cnt) { return cnt == 1 ? sum : finishDiv16(sum, cnt); }
 inline uint32_t finishW16(uint32_t sum, uint32_t maxv) { return std::min<uint32_t>(maxv, uint32_t((uint64_t(sum) + 0x8000) >> 16)); }
 
+// One output sample. rows: the window rows of every source (RowWindow::rows()), pointing at sample 0.
 template <typename T>
-inline T sampleAt(const uint8_t* plane, ptrdiff_t stride, int y, int x) {
-  return reinterpret_cast<const T*>(plane + y * stride)[x];
-}
-
-template <typename T>
-inline T filterPixel(const PlaneArgs& a, int y, int x) {
-  const int r = a.rad;
-  const uint32_t c = sampleAt<T>(a.src[0], a.stride[0], y, x);
+inline T filterPixel(const PlaneArgs& a, const uint8_t* const* rows, int x) {
+  const int r = a.rad, side = 2 * r + 1;
+  const uint32_t c = reinterpret_cast<const T*>(rows[r])[x];
   uint32_t sum = 0, cnt = 0;
   for (int s = 0; s < a.nsrc; s++) {
     const uint16_t* thr = a.thr[s];
     const uint16_t* w = a.weight[s];
     int k = 0;
-    for (int dy = -r; dy <= r; dy++) {
-      const T* row = reinterpret_cast<const T*>(a.src[s] + (y + dy) * a.stride[s]);
+    for (int dy = 0; dy < side; dy++) {
+      const T* row = reinterpret_cast<const T*>(rows[s * side + dy]);
       for (int dx = -r; dx <= r; dx++, k++) {
         const uint32_t n = row[x + dx];
         const bool pass = uint32_t(std::abs(int(c) - int(n))) <= thr[k];
@@ -117,9 +113,9 @@ inline T filterPixel(const PlaneArgs& a, int y, int x) {
 }
 
 template <typename T>
-inline void filterRowScalar(const PlaneArgs& a, int y, int x0, int x1) {
-  T* d = reinterpret_cast<T*>(a.dst + y * a.dst_stride);
-  for (int x = x0; x < x1; x++) d[x] = filterPixel<T>(a, y, x);
+inline void filterRowScalar(const PlaneArgs& a, const uint8_t* const* rows, uint8_t* drow, int x0, int x1) {
+  T* d = reinterpret_cast<T*>(drow);
+  for (int x = x0; x < x1; x++) d[x] = filterPixel<T>(a, rows, x);
 }
 
 }  // namespace
