@@ -1,0 +1,136 @@
+// SPDX-License-Identifier: MIT
+// Compares every available SIMD tier with the C reference kernels on random data: widths 1..80, every mode family,
+// 2d and 3d, every radius, 8/10/12/16 bit, random thresholds, real and random weights, random, extreme and flat content.
+// Run: meson test -C build (or build/kernel_test). Exit code 0 = all tiers identical to C.
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <random>
+#include <vector>
+
+#include "core/deen.hpp"
+#include "core/kernels.hpp"
+
+using namespace deen;
+
+namespace {
+
+std::mt19937 rng(20031);
+
+int rnd(int lo, int hi) { return std::uniform_int_distribution<int>(lo, hi)(rng); }
+
+// A padded plane: pad samples on every side, padding filled like the image (the kernels never see unpadded memory).
+struct Plane {
+  std::vector<uint8_t> buf;
+  ptrdiff_t stride = 0;
+  const uint8_t* origin = nullptr;
+};
+
+Plane makePlane(int w, int h, int pad, int bits, int kind) {
+  Plane p;
+  const int bps = bits == 8 ? 1 : 2;
+  p.stride = ptrdiff_t(w + 2 * pad + rnd(0, 20)) * bps;
+  p.buf.assign(size_t(p.stride) * (h + 2 * pad) + 64, 0);
+  const int maxv = (1 << bits) - 1;
+  const int base = rnd(0, maxv);
+  for (int y = 0; y < h + 2 * pad; y++)
+    for (int x = 0; x < p.stride / bps; x++) {
+      int v;
+      switch (kind) {
+        case 1: v = rnd(0, 1) ? maxv : 0; break;
+        case 2: v = std::min(maxv, std::max(0, base + rnd(-3, 3) * (1 << (bits - 8)))); break;
+        case 3: v = base; break;
+        default: v = rnd(0, maxv); break;
+      }
+      uint8_t* row = p.buf.data() + y * p.stride;
+      if (bps == 1)
+        row[x] = uint8_t(v);
+      else
+        reinterpret_cast<uint16_t*>(row)[x] = uint16_t(v);
+    }
+  p.origin = p.buf.data() + pad * p.stride + pad * bps;
+  return p;
+}
+
+int failures = 0, checks = 0;
+
+}  // namespace
+
+int main() {
+  std::vector<std::pair<Isa, const char*>> tiers;
+  for (int opt = 1; opt <= 3; opt++) {
+    Isa isa;
+    if (selectIsa(opt, &isa)) tiers.push_back({isa, isaName(isa)});
+  }
+  std::printf("tiers:");
+  for (auto& t : tiers) std::printf(" %s", t.second);
+  std::printf("\n");
+
+  const int bitsList[] = {8, 10, 12, 16};
+  for (int iter = 0; iter < 1500; iter++) {
+    const int family = iter % 3;
+    const bool d3 = (iter / 3) % 2 == 1;
+    const int rad = rnd(1, d3 ? 4 : 7);
+    const int bits = bitsList[rnd(0, 3)];
+    const int w = rnd(1, 80), h = rnd(1, 6);
+    const int kind = rnd(0, 3);
+    const int nsrc = d3 ? 3 : 1;
+    const int taps = (2 * rad + 1) * (2 * rad + 1);
+    const int shift = bits - 8;
+    Plane src[3];
+    std::vector<uint16_t> thr[3], wt[3];
+    for (int s = 0; s < nsrc; s++) {
+      src[s] = makePlane(w, h, rad, bits, kind);
+      if (family == kAMode) {
+        thr[s] = adaptiveThresholds(rad, rnd(0, 255), float(rnd(0, 100)) / 100.0f);
+      } else {
+        thr[s].assign(size_t(taps), uint16_t(rnd(0, 255)));
+      }
+      for (uint16_t& t : thr[s]) t = uint16_t(t << shift);
+      if (rnd(0, 7) == 0)
+        for (uint16_t& t : thr[s]) t = uint16_t(rnd(0, (255 << shift)));
+      if (family == kWMode) {
+        wt[s] = distanceWeights(rad, float(rnd(0, 100)) / 100.0f, d3);
+        if (d3 && s == 0)
+          for (uint16_t& x : wt[s]) x = uint16_t(x * 2);
+        if (rnd(0, 7) == 0 && bits == 8)
+          for (uint16_t& x : wt[s]) x = uint16_t(rnd(0, 65535));
+      }
+    }
+    const int bps = bits == 8 ? 1 : 2;
+    const ptrdiff_t dstride = ptrdiff_t(w + rnd(0, 16)) * bps;
+    std::vector<uint8_t> ref(size_t(dstride) * h, 0xAB), got(size_t(dstride) * h, 0xAB);
+    PlaneArgs a;
+    for (int s = 0; s < nsrc; s++) {
+      a.src[s] = src[s].origin;
+      a.stride[s] = src[s].stride;
+      a.thr[s] = thr[s].data();
+      a.weight[s] = family == kWMode ? wt[s].data() : nullptr;
+    }
+    a.nsrc = nsrc;
+    a.dst_stride = dstride;
+    a.width = w;
+    a.y0 = rnd(0, 1) ? 0 : std::min(h, rad);
+    a.y1 = std::max(a.y0, rnd(0, 1) ? h : h - rad);
+    a.rad = rad;
+    a.bits = bits;
+    a.family = family;
+    a.dst = ref.data();
+    kernelsC().filter(a);
+    for (auto& t : tiers) {
+      std::fill(got.begin(), got.end(), uint8_t(0xAB));
+      a.dst = got.data();
+      kernelsFor(t.first).filter(a);
+      checks++;
+      if (got != ref) {
+        if (failures < 30)
+          std::printf("FAIL %s family=%d 3d=%d rad=%d bits=%d w=%d h=%d kind=%d\n", t.second, family, int(d3), rad,
+                      bits, w, h, kind);
+        failures++;
+      }
+    }
+  }
+  std::printf("%d checks, %d failures\n", checks, failures);
+  return failures ? 1 : 0;
+}
